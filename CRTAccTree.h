@@ -38,8 +38,10 @@ struct CRTAccNode {
 
 // Main acceleration tree class
 class CRTAccTree {
+
+protected:
+std::vector<CRTAccNode> nodes;
 private:
-    std::vector<CRTAccNode> nodes;
     int maxDepth;
     int maxBoxTrianglesCount;
     
