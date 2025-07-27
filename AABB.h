@@ -2,6 +2,7 @@
 #include "CRTVector.h"
 #include "CRTRay.h"
 #include <limits>
+#include <algorithm>
 
 struct AABB {
     CRTVector min, max;
@@ -9,26 +10,82 @@ struct AABB {
     AABB() = default;
     AABB(const CRTVector& mn, const CRTVector& mx) : min(mn), max(mx) {}
 
-    // Fast ray-AABB using precomputed invDir & sign
+    // Fixed ray-AABB intersection using slab method (main bug fix)
     bool intersect(const CRTRay& ray, float& tNear, float& tFar) const {
-        const auto& orig = ray.getOrigin();
-        const auto& dir  = ray.getDirection();
-        float invDir[3] = {1.0f/dir.getX(), 1.0f/dir.getY(), 1.0f/dir.getZ()};
-        int sign[3]     = {invDir[0] < 0, invDir[1] < 0, invDir[2] < 0};
+        const CRTVector& orig = ray.getOrigin();
+        const CRTVector& dir = ray.getDirection();
+        
+        // X slab
+        float t1 = (min.getX() - orig.getX()) / dir.getX();
+        float t2 = (max.getX() - orig.getX()) / dir.getX();
+        
+        if (t1 > t2) std::swap(t1, t2);
+        tNear = t1;
+        tFar = t2;
+        
+        // Y slab
+        t1 = (min.getY() - orig.getY()) / dir.getY();
+        t2 = (max.getY() - orig.getY()) / dir.getY();
+        
+        if (t1 > t2) std::swap(t1, t2);
+        
+        if (tNear > t2 || t1 > tFar) return false;
+        tNear = std::max(tNear, t1);
+        tFar = std::min(tFar, t2);
+        
+        // Z slab
+        t1 = (min.getZ() - orig.getZ()) / dir.getZ();
+        t2 = (max.getZ() - orig.getZ()) / dir.getZ();
+        
+        if (t1 > t2) std::swap(t1, t2);
+        
+        if (tNear > t2 || t1 > tFar) return false;
+        tNear = std::max(tNear, t1);
+        tFar = std::min(tFar, t2);
+        
+        return tFar > 1e-4f; // Consistent epsilon
+    }
 
-        const float bounds[2][3] = {{min.getX(), min.getY(), min.getZ()},
-                                    {max.getX(), max.getY(), max.getZ()}};
+    // Simple intersection test when you don't need t values
+    bool intersects(const CRTRay& ray) const {
+        float tNear, tFar;
+        return intersect(ray, tNear, tFar);
+    }
 
-        tNear = (bounds[sign[0]][0] - orig.getX()) * invDir[0];
-        tFar  = (bounds[1-sign[0]][0] - orig.getX()) * invDir[0];
+    // Expand AABB to include a point
+    void expand(const CRTVector& point) {
+        min = CRTVector(
+            std::min(min.getX(), point.getX()),
+            std::min(min.getY(), point.getY()),
+            std::min(min.getZ(), point.getZ())
+        );
+        max = CRTVector(
+            std::max(max.getX(), point.getX()),
+            std::max(max.getY(), point.getY()),
+            std::max(max.getZ(), point.getZ())
+        );
+    }
 
-        for (int i = 1; i < 3; ++i) {
-            float t1 = (bounds[sign[i]][i] - (i==1?orig.getY():orig.getZ())) * invDir[i];
-            float t2 = (bounds[1-sign[i]][i] - (i==1?orig.getY():orig.getZ())) * invDir[i];
-            if ((tNear > t2) || (t1 > tFar)) return false;
-            tNear = t1 > tNear ? t1 : tNear;
-            tFar  = t2 < tFar  ? t2 : tFar;
-        }
-        return tFar > 0;
+    // Expand AABB to include another AABB
+    void expand(const AABB& other) {
+        expand(other.min);
+        expand(other.max);
+    }
+
+    // Get center point
+    CRTVector center() const {
+        return CRTVector(
+            (min.getX() + max.getX()) * 0.5f,
+            (min.getY() + max.getY()) * 0.5f,
+            (min.getZ() + max.getZ()) * 0.5f
+        );
+    }
+
+    // Surface area (useful for BVH construction)
+    float surfaceArea() const {
+        float dx = max.getX() - min.getX();
+        float dy = max.getY() - min.getY();
+        float dz = max.getZ() - min.getZ();
+        return 2.0f * (dx * dy + dx * dz + dy * dz);
     }
 };
