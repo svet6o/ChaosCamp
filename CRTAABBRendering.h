@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <iostream>
+#include <map>
 
 #include "CRTColor.h"
 #include "CRTRay.h"
@@ -17,23 +18,14 @@
 #include "CRTCamera.h"
 #include "CRTSettings.h"
 
-// Forward declaration
-CRTColor traceRay(
-    const CRTRay& ray,
-    const std::vector<CRTTriangle>& scene,
-    const std::vector<CRTMaterial>& materials,
-    const std::vector<CRTLight>& lights,
-    const CRTSettings& settings,
-    int depth,
-    bool isShadowRay,
-    float shadowBias,
-    float refractionBias
-);
+// Forward declarations for helper functions
+static bool Refract(const CRTVector& I, const CRTVector& N, float eta1, float eta2, CRTVector& refracted);
+static float FresnelSchlick(const CRTVector& I, const CRTVector& N, float ior);
 
-// AABB-accelerated ray tracing function
-inline CRTColor traceRayWithAABB(
+// Forward declaration of the main tracing function
+CRTColor traceRayWithAABB(
     const CRTRay& ray,
-    const std::vector<CRTSceneObject>& scene,
+    const std::vector<CRTSceneObject>& sceneObjects,
     const std::vector<CRTMaterial>& materials,
     const std::vector<CRTLight>& lights,
     const CRTSettings& settings,
@@ -41,6 +33,19 @@ inline CRTColor traceRayWithAABB(
     bool isShadowRay = false,
     float shadowBias = 1e-4f,
     float refractionBias = 1e-4f
+);
+
+// AABB-accelerated ray tracing function
+inline CRTColor traceRayWithAABB(
+    const CRTRay& ray,
+    const std::vector<CRTSceneObject>& sceneObjects,
+    const std::vector<CRTMaterial>& materials,
+    const std::vector<CRTLight>& lights,
+    const CRTSettings& settings,
+    int depth,
+    bool isShadowRay,
+    float shadowBias,
+    float refractionBias
 ) {
     if (depth > 5) {
         return settings.backgroundColor;
@@ -93,47 +98,51 @@ inline CRTColor traceRayWithAABB(
                          : mat.albedo;
 
     // Material-specific shading logic
-   switch (mat.type) {
+    switch (mat.type) {
         case CRTMaterial::Type::DIFFUSE: {
-            CRTColor accum(0, 0, 0);
-            for (const auto& light : lights) {
-                CRTVector L = light.getPosition() - hitPoint;
-                float dist = L.length();
-                L = L.normalize();
+    CRTColor accum(0, 0, 0);
+    for (const auto& light : lights) {
+        CRTVector L = light.getPosition() - hitPoint;
+        float dist = L.length();
+        L = L.normalize();
 
-                float NdotL = std::max(0.0f, normalToUse.dot(L));
-                if (NdotL <= 0.0f) continue;
+        float NdotL = std::max(0.0f, normalToUse.dot(L));
+        if (NdotL <= 0.0f) continue;
 
-                // shadow ray
-                CRTRay shadowRay(hitPoint + normalToUse * shadowBias, L);
-                bool inShadow = false;
-                for (const auto& tri : scene) {
-                    if (&tri == &scene[hitIdx]) continue;
-                    float t2, u2, v2;
-                    CRTVector n2, uv2;
-                    if (tri.intersect(shadowRay, t2, u2, v2, n2, uv2) && t2 < dist) {
-                        int m2 = tri.getMaterialIndex();
-                        if (materials[m2].type != CRTMaterial::Type::REFRACTIVE) {
-                            inShadow = true;
-                            break;
-                        }
-                    }
+        // Shadow ray
+        CRTRay shadowRay(hitPoint + L * shadowBias, L); // offset по посока на лъча (по-стабилно)
+        bool inShadow = false;
+
+        for (size_t objIdx = 0; objIdx < sceneObjects.size(); ++objIdx) {
+            const auto& obj = sceneObjects[objIdx];
+
+            // Игнорирай само същия триъгълник от същия обект
+            int ignoreTri = (int)objIdx == hitObjectIndex ? hitTriangleIndex : -1;
+
+            if (obj.intersectShadowRay(shadowRay, dist, ignoreTri)) {
+                const auto& shadowMat = materials[obj.getMaterialIndex()];
+                if (shadowMat.type != CRTMaterial::Type::REFRACTIVE) {
+                    inShadow = true;
+                    break;
                 }
-
-                if (inShadow) continue;
-
-                float Li = light.getIntensity();
-                float attenuation = Li / (4.0f * PI * dist * dist + 1e-4f);
-                accum += baseColor * (attenuation * NdotL);
+                // Ако искаш частични сенки през стъкло – тук добави attenuation вместо просто да пропускаш
             }
-            return accum;
         }
+
+        if (inShadow) continue;
+
+        float Li = light.getIntensity();
+        float attenuation = Li / (4.0f * 3.14159265f * dist * dist + 1e-4f);
+        accum += baseColor * (attenuation * NdotL);
+    }
+    return accum;
+}
 
         case CRTMaterial::Type::REFLECTIVE: {
             CRTVector I = ray.getDirection().normalize();
             CRTVector R = I - normalToUse * (2.0f * I.dot(normalToUse));
             CRTRay reflectRay(hitPoint + normalToUse * shadowBias, R.normalize());
-            return traceRayWithAABB(reflectRay, scene, materials, lights, settings, depth + 1);
+            return traceRayWithAABB(reflectRay, sceneObjects, materials, lights, settings, depth + 1);
         }
 
         case CRTMaterial::Type::REFRACTIVE: {
@@ -147,13 +156,13 @@ inline CRTColor traceRayWithAABB(
 
             CRTVector Rdir = I - N * (2.0f * I.dot(N));
             CRTRay reflectRay(hitPoint + N * shadowBias, Rdir.normalize());
-            CRTColor C_reflect = traceRayWithAABB(reflectRay, scene, materials, lights, settings, depth + 1);
+            CRTColor C_reflect = traceRayWithAABB(reflectRay, sceneObjects, materials, lights, settings, depth + 1);
 
             CRTVector Tdir;
             CRTColor C_refract(0, 0, 0);
             if (Refract(I, N, eta1, eta2, Tdir)) {
                 CRTRay refractRay(hitPoint - N * refractionBias, Tdir);
-                C_refract = traceRayWithAABB(refractRay, scene, materials, lights, settings, depth + 1);
+                C_refract = traceRayWithAABB(refractRay, sceneObjects, materials, lights, settings, depth + 1);
             }
 
             if (isShadowRay) {
@@ -170,7 +179,7 @@ inline CRTColor traceRayWithAABB(
             return baseColor;
 
         default:
-            return CRTColor(255, 0, 255); // Магента за грешка
+            return CRTColor(255, 0, 255); // Magenta for error
     }
 }
 
