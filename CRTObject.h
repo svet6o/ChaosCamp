@@ -107,6 +107,41 @@ public:
         return false; // No blocking intersection found
     }
 
+    // Fast shadow ray intersection test (returns early on first hit), with ability to ignore one triangle
+bool intersectShadowRay(const CRTRay& ray,
+                        float maxDistance,
+                        int ignoreTriangle) const
+{
+    constexpr float kEps = 1e-4f;
+
+    float tNear, tFar;
+    if (!boundingBox.intersect(ray, tNear, tFar)) {
+        return false;
+    }
+
+    // Ако пресичането с AABB започва след светлината – няма смисъл да тестваме
+    if (tNear > maxDistance) {
+        return false;
+    }
+
+    // Тествай триъгълниците
+    for (size_t i = 0; i < triangles.size(); ++i) {
+        if ((int)i == ignoreTriangle) continue; // <-- ключовата линия
+
+        float t, u, v;
+        CRTVector normal, uv;
+
+        if (triangles[i].intersect(ray, t, u, v, normal, uv)) {
+            if (t > kEps && t < maxDistance - kEps) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+
     // Get the triangle at the specified index
     const CRTTriangle& getTriangle(int index) const {
         return triangles[index];
