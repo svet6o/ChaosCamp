@@ -1,6 +1,5 @@
 
 
-
 #pragma once
 
 #include <vector>
@@ -84,7 +83,6 @@ inline CRTColor traceRayWithBVH(
             }
             return accum;
         }
-
         case CRTMaterial::Type::REFLECTIVE: {
             CRTVector I = ray.getDirection().normalize();
             CRTVector R = I - normalToUse * (2.0f * I.dot(normalToUse));
@@ -109,7 +107,7 @@ inline CRTColor traceRayWithBVH(
             CRTColor C_refract(0, 0, 0);
             if (Refract(I, N, eta1, eta2, Tdir)) {
                 CRTRay refractRay(hitPoint - N * refractionBias, Tdir);
-                C_refract = traceRayWithBVH(refractRay, triangles, materials, lights, settings, accTree, depth + 1);
+                C_refract =  traceRayWithBVH(reflectRay, triangles, materials, lights, settings, accTree, depth + 1);
             }
 
             if (isShadowRay) {
@@ -126,9 +124,10 @@ inline CRTColor traceRayWithBVH(
             return baseColor;
 
         default:
-            return CRTColor(255, 0, 255); // Magenta for error
+            return CRTColor(255, 0, 255); // Магента за грешка
     }
 }
+
 
 // Bucket structure for multithreaded rendering
 struct BVHBucket {
