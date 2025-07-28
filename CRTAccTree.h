@@ -1,387 +1,355 @@
 #pragma once
 
-#include <vector>
-#include <limits>
-#include <algorithm>
-#include <iostream>
-#include <thread>
-#include <mutex>
-#include <fstream>
-
-#include "CRTTriangle.h"
 #include "CRTAABB.h"
+#include "CRTTriangle.h"
 #include "CRTRay.h"
-#include "CRTColor.h"
 #include "CRTMaterial.h"
-#include "CRTLight.h"
-#include "CRTCamera.h"
-#include "CRTSettings.h"
+#include <vector>
+#include <thread>
+#include <future>
+#include <algorithm>
+#include <limits>
+#include <numeric>
 
-// Forward declaration of trace function
-static bool Refract(const CRTVector& I, const CRTVector& N, float eta1, float eta2, CRTVector& refracted);
-static float FresnelSchlick(const CRTVector& I, const CRTVector& N, float ior);
-
-// Acceleration tree node
-struct CRTAccNode {
-    CRTAABB boundingBox;
-    int child0Idx = -1;
-    int child1Idx = -1;
-    std::vector<int> triangleIndices; // Indices into the main triangle array
-    
-    CRTAccNode() = default;
-    CRTAccNode(const CRTAABB& bbox) : boundingBox(bbox) {}
-    
-    bool isLeaf() const {
-        return child0Idx == -1 && child1Idx == -1;
-    }
+// Forward declaration for intersection data
+struct IntersectionData {
+    int triangleIndex = -1;
+    float u = 0.0f, v = 0.0f;
+    CRTVector normal;
+    CRTVector uv;
 };
 
-// Main acceleration tree class
-class CRTAccTree {
+/// Node for the acceleration tree structure,
+/// holding a box for the sub space the node represents and indices for the children sub spaces represented by nodes
+struct CRTAccTreeNode {
+    CRTAccTreeNode(const CRTAABB& CRTAABB, const int parentIdx, const int leftNodeIdx, const int rightNodeIdx, const std::vector<int>& triangles)
+        : CRTAABB(CRTAABB), parent(parentIdx), triangles(triangles) {
+        children[0] = leftNodeIdx;
+        children[1] = rightNodeIdx;
+    }
 
-protected:
-std::vector<CRTAccNode> nodes;
-private:
-    int maxDepth;
-    int maxBoxTrianglesCount;
-    
-public:
-    CRTAccTree() : maxDepth(20), maxBoxTrianglesCount(8) {}
-    
-    void setMaxDepth(int depth) { maxDepth = depth; }
-    void setMaxTrianglesPerNode(int count) { maxBoxTrianglesCount = count; }
-    
-    // Add a new node and return its index
-    int addNode(const CRTAABB& bbox, int child0, int child1, const std::vector<int>& triangles) {
-        nodes.emplace_back(bbox);
-        int idx = static_cast<int>(nodes.size() - 1);
-        nodes[idx].child0Idx = child0;
-        nodes[idx].child1Idx = child1;
-        nodes[idx].triangleIndices = triangles;
-        return idx;
-    }
-    
-    struct SplitResult {
-        CRTAABB leftAABB, rightAABB;
-        std::vector<int> leftTriangles, rightTriangles;
-        float cost;
-    };
-    
-    SplitResult findBestSplit(const CRTAABB& nodeAABB, const std::vector<int>& triangleIndices,
-                              const std::vector<CRTTriangle>& allTriangles) const {
-        SplitResult bestSplit;
-        bestSplit.cost = std::numeric_limits<float>::max();
-        
-        // Try all 3 axes
-        for (int axis = 0; axis < 3; ++axis) {
-            // Collect triangle centroids for this axis
-            std::vector<std::pair<float, int>> centroids;
-            centroids.reserve(triangleIndices.size());
-            
-            for (int triIdx : triangleIndices) {
-                const CRTTriangle& tri = allTriangles[triIdx];
-                CRTVector centroid = (tri.getVertex(0) + tri.getVertex(1) + tri.getVertex(2)) * (1.0f/3.0f);
-                float coord = (axis == 0) ? centroid.getX() : (axis == 1) ? centroid.getY() : centroid.getZ();
-                centroids.emplace_back(coord, triIdx);
-            }
-            
-            // Sort by centroid coordinate
-            std::sort(centroids.begin(), centroids.end());
-            
-            // Try different split positions
-            for (size_t i = 1; i < centroids.size(); ++i) {
-                // Split at position i (first i triangles go left)
-                std::vector<int> leftTris, rightTris;
-                leftTris.reserve(i);
-                rightTris.reserve(centroids.size() - i);
-                
-                for (size_t j = 0; j < i; ++j) {
-                    leftTris.push_back(centroids[j].second);
-                }
-                for (size_t j = i; j < centroids.size(); ++j) {
-                    rightTris.push_back(centroids[j].second);
-                }
-                
-                // Calculate AABBs for each side
-                CRTAABB leftAABB, rightAABB;
-                for (int idx : leftTris) {
-                    leftAABB.expand(CRTAABB::fromTriangle(allTriangles[idx]));
-                }
-                for (int idx : rightTris) {
-                    rightAABB.expand(CRTAABB::fromTriangle(allTriangles[idx]));
-                }
-                
-                // Calculate SAH cost
-                float leftArea = leftAABB.getSurfaceArea();
-                float rightArea = rightAABB.getSurfaceArea();
-                float totalArea = nodeAABB.getSurfaceArea();
-                
-                float cost = 1.0f + (leftArea / totalArea) * leftTris.size() + 
-                                   (rightArea / totalArea) * rightTris.size();
-                
-                if (cost < bestSplit.cost) {
-                    bestSplit.cost = cost;
-                    bestSplit.leftAABB = leftAABB;
-                    bestSplit.rightAABB = rightAABB;
-                    bestSplit.leftTriangles = std::move(leftTris);
-                    bestSplit.rightTriangles = std::move(rightTris);
-                }
-            }
-        }
-        
-        return bestSplit;
-    }
-    
-    // AABB-triangle intersection algorithm
-    bool aabbTriangleIntersect(const CRTAABB& nodeAABB, const CRTAABB& triAABB) const {
-        // If the boxes do not intersect on one of the axis, there isn't an intersection
-        
-        // X axis
-        if (triAABB.minPoint.getX() > nodeAABB.maxPoint.getX()) return false;
-        if (triAABB.maxPoint.getX() < nodeAABB.minPoint.getX()) return false;
-        
-        // Y axis
-        if (triAABB.minPoint.getY() > nodeAABB.maxPoint.getY()) return false;
-        if (triAABB.maxPoint.getY() < nodeAABB.minPoint.getY()) return false;
-        
-        // Z axis
-        if (triAABB.minPoint.getZ() > nodeAABB.maxPoint.getZ()) return false;
-        if (triAABB.maxPoint.getZ() < nodeAABB.minPoint.getZ()) return false;
-        
-        return true;
-    }
-    
-    // Recursive tree building function
-    void buildAccTree(int parentIdx, int depth, const std::vector<int>& triangleIndices, 
-                      const std::vector<CRTTriangle>& allTriangles) {
-        
-        // Check termination conditions
-        if (depth >= maxDepth || 
-            static_cast<int>(triangleIndices.size()) <= maxBoxTrianglesCount ||
-            triangleIndices.size() <= 1) {
-            nodes[parentIdx].triangleIndices = triangleIndices;
-            return;
-        }
-        
-        // Find the best split
-        SplitResult split = findBestSplit(nodes[parentIdx].boundingBox, triangleIndices, allTriangles);
-        
-        // Check if split is worthwhile (avoid bad splits)
-        if (split.leftTriangles.empty() || split.rightTriangles.empty() ||
-            split.cost >= triangleIndices.size()) {
-            // Split didn't improve things, make this a leaf
-            nodes[parentIdx].triangleIndices = triangleIndices;
-            return;
-        }
-        
-        // Create child nodes
-        int child0Idx = addNode(split.leftAABB, -1, -1, std::vector<int>());
-        int child1Idx = addNode(split.rightAABB, -1, -1, std::vector<int>());
-        
-        nodes[parentIdx].child0Idx = child0Idx;
-        nodes[parentIdx].child1Idx = child1Idx;
-        
-        // Recursively build children
-        buildAccTree(child0Idx, depth + 1, split.leftTriangles, allTriangles);
-        buildAccTree(child1Idx, depth + 1, split.rightTriangles, allTriangles);
-    }
-    
-    // Main build function
-    void build(const std::vector<CRTTriangle>& triangles, int maxTriangles = 8, int maxTreeDepth = 20) {
-        maxBoxTrianglesCount = maxTriangles;
-        maxDepth = maxTreeDepth;
-        nodes.clear();
-        
+    /// Intersect the given ray with the triangles in the box, meaningful only for leaf nodes, the others do not store triangles
+    void intersect(
+        const CRTRay& ray,
+        const float maxT,
+        const std::vector<CRTTriangle>& sceneTriangles,
+        const std::vector<CRTMaterial>& materials,
+        float& t,
+        float& minT,
+        IntersectionData& data
+    ) const {
+        // Only leaf nodes have triangles to intersect
         if (triangles.empty()) return;
         
-        // Create AABB for the scene
-        CRTAABB sceneAABB = CRTAABB::fromTriangles(triangles);
-        
-        // Gather all triangles in an array
-        std::vector<int> allTriangleIndices;
-        allTriangleIndices.reserve(triangles.size());
-        for (size_t i = 0; i < triangles.size(); ++i) {
-            allTriangleIndices.push_back(static_cast<int>(i));
-        }
-        
-        // Create root node
-        int rootIdx = addNode(sceneAABB, -1, -1, std::vector<int>());
-        
-        // Recursively build the acceleration tree
-        buildAccTree(rootIdx, 0, allTriangleIndices, triangles);
-        
-        std::cout << "Acceleration tree built with " << nodes.size() << " nodes\n";
-    }
-    
-    // Tree traversal for ray intersection
-  bool intersect(const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
-                   float& closestT, int& hitTriangleIdx, float& hitU, float& hitV,
-                   CRTVector& hitNormal, CRTVector& hitUV) const {
-        if (nodes.empty()) return false;
-        
-        closestT = std::numeric_limits<float>::max();
-        hitTriangleIdx = -1;
-        bool hasHit = false;
-        
-        intersectNode(0, ray, triangles, closestT, hitTriangleIdx, hitU, hitV, hitNormal, hitUV, hasHit);
-        
-        return hasHit;
-    }
-    
-private:
-     void intersectNode(int nodeIdx, const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
-                       float& closestT, int& hitTriangleIdx, float& hitU, float& hitV,
-                       CRTVector& hitNormal, CRTVector& hitUV, bool& hasHit) const {
-        
-        const CRTAccNode& node = nodes[nodeIdx];
-        
-        // Test ray against node's AABB with distance constraint
-        float tNear, tFar;
-        if (!node.boundingBox.intersect(ray, tNear, tFar)) {
-            return;
-        }
-        
-        // Early exit if AABB is farther than current closest hit
-        if (tNear > closestT) {
-            return;
-        }
-        
-        if (node.isLeaf()) {
-            // Test against all triangles in this leaf
-            for (int triIdx : node.triangleIndices) {
-                float t, u, v;
-                CRTVector normal, uv;
-                
-                if (triangles[triIdx].intersect(ray, t, u, v, normal, uv)) {
-                    if (t > 1e-4f && t < closestT) { // Add epsilon check
-                        closestT = t;
-                        hitTriangleIdx = triIdx;
-                        hitU = u;
-                        hitV = v;
-                        hitNormal = normal;
-                        hitUV = uv;
-                        hasHit = true;
-                    }
-                }
-            }
-        } else {
-            // Test children in order of distance (front-to-back traversal)
-            bool traverseChild0First = true;
+        for (int triIdx : triangles) {
+            float hitT, hitU, hitV;
+            CRTVector hitNormal, hitUV;
             
-            if (node.child0Idx != -1 && node.child1Idx != -1) {
-                // Calculate approximate distances to child AABBs
-                float dist0 = (nodes[node.child0Idx].boundingBox.getCenter() - ray.getOrigin()).lengthSquared();
-                float dist1 = (nodes[node.child1Idx].boundingBox.getCenter() - ray.getOrigin()).lengthSquared();
-                traverseChild0First = (dist0 <= dist1);
-            }
-            
-            if (traverseChild0First) {
-                if (node.child0Idx != -1) {
-                    intersectNode(node.child0Idx, ray, triangles, closestT, hitTriangleIdx, 
-                                 hitU, hitV, hitNormal, hitUV, hasHit);
-                }
-                if (node.child1Idx != -1) {
-                    intersectNode(node.child1Idx, ray, triangles, closestT, hitTriangleIdx, 
-                                 hitU, hitV, hitNormal, hitUV, hasHit);
-                }
-            } else {
-                if (node.child1Idx != -1) {
-                    intersectNode(node.child1Idx, ray, triangles, closestT, hitTriangleIdx, 
-                                 hitU, hitV, hitNormal, hitUV, hasHit);
-                }
-                if (node.child0Idx != -1) {
-                    intersectNode(node.child0Idx, ray, triangles, closestT, hitTriangleIdx, 
-                                 hitU, hitV, hitNormal, hitUV, hasHit);
+            if (sceneTriangles[triIdx].intersect(ray, hitT, hitU, hitV, hitNormal, hitUV)) {
+                if (hitT > 1e-4f && hitT < maxT && hitT < minT) {
+                    minT = hitT;
+                    t = hitT;
+                    data.triangleIndex = triIdx;
+                    data.u = hitU;
+                    data.v = hitV;
+                    data.normal = hitNormal;
+                    data.uv = hitUV;
                 }
             }
         }
     }
 
+    std::vector<int> triangles; ///< In case of a leaf node a list with the triangles for intersection in the box for the node, empty otherwise
+    CRTAABB CRTAABB; ///< Axis aligned bounding box for the sub space this node represents
+    int children[2]; ///< The left and right indices for the node's children, indexing in the big list for the tree with all the nodes
+    int parent; ///< The index of the parent node for this node and its sub space
+};
+
+class CRTAccTree {
+private:
+    std::vector<CRTAccTreeNode> nodes;
+    std::vector<CRTTriangle> sceneTriangles;
+    int rootIdx;
+    
+    // Build parameters
+    static constexpr int maxBoxTrianglesCount = 8;
+    static constexpr int maxDepth = 20;
+    static constexpr int axisCount = 3;
+    
+    // Threading parameters
+    static constexpr int MIN_TRIANGLES_FOR_THREADING = 1000;
+    static constexpr int MAX_DEPTH_FOR_THREADING = 4;
+
 public:
-    // Shadow ray intersection (early termination)
-    bool intersectShadow(const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
-                         const std::vector<CRTMaterial>& materials, float maxDistance,
-                         int ignoreTriangleIdx = -1) const {
-        if (nodes.empty()) return false;
-        
-        return intersectShadowNode(0, ray, triangles, materials, maxDistance, ignoreTriangleIdx);
+    CRTAccTree() : rootIdx(-1) {}
+
+        /// Add node to the tree and return its index
+    int addNode(const CRTAABB& CRTAABB, int parentIdx, int child0Idx, int child1Idx, const std::vector<int>& triangles) {
+        nodes.emplace_back(CRTAABB, parentIdx, child0Idx, child1Idx, triangles);
+        return static_cast<int>(nodes.size() - 1);
     }
     
-private:
-    bool intersectShadowNode(int nodeIdx, const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
-                             const std::vector<CRTMaterial>& materials, float maxDistance,
-                             int ignoreTriangleIdx) const {
+    /// Build acceleration tree from triangles following the specified algorithm
+    void build(const std::vector<CRTTriangle>& triangles, int maxLeafSize = 8, int maxTreeDepth = 20) {
+        sceneTriangles = triangles;
+        if (triangles.empty()) return;
         
-        const CRTAccNode& node = nodes[nodeIdx];
+        // Gather all triangles in an array
+        std::vector<int> allTriangles(triangles.size());
+        std::iota(allTriangles.begin(), allTriangles.end(), 0);
         
-        // Test ray against node's AABB with distance constraint
-        float tNear, tFar;
-        if (!node.boundingBox.intersect(ray, tNear, tFar)) {
-            return false;
-        }
+        // Create CRTAABB for the scene
+        CRTAABB sceneCRTAABB = CRTAABB::fromTriangles(sceneTriangles, allTriangles);
         
-        // If intersection is beyond the light, no shadow
-        if (tNear > maxDistance) {
-            return false;
-        }
+        // Create root node
+        rootIdx = addNode(sceneCRTAABB, -1, -1, -1,std::vector<int>());
         
-        if (node.isLeaf()) {
-            // Test against all triangles in this leaf
-            for (int triIdx : node.triangleIndices) {
-                if (triIdx == ignoreTriangleIdx) continue;
-                
-                float t, u, v;
-                CRTVector normal, uv;
-                
-                if (triangles[triIdx].intersect(ray, t, u, v, normal, uv)) {
-                    if (t > 1e-4f && t < maxDistance) {
-                        // Check if this is a refractive material (transparent)
-                        int matIdx = triangles[triIdx].getMaterialIndex();
-                        if (matIdx < static_cast<int>(materials.size()) && 
-                            materials[matIdx].type == CRTMaterial::Type::REFRACTIVE) {
-                            continue; // Skip transparent materials for shadows
-                        }
-                        return true; // Shadow ray blocked
-                    }
-                }
-            }
-        } else {
-            // Recursively test child nodes
-            if (node.child0Idx != -1) {
-                if (intersectShadowNode(node.child0Idx, ray, triangles, materials, maxDistance, ignoreTriangleIdx)) {
-                    return true;
-                }
-            }
-            if (node.child1Idx != -1) {
-                if (intersectShadowNode(node.child1Idx, ray, triangles, materials, maxDistance, ignoreTriangleIdx)) {
-                    return true;
-                }
-            }
+        // Recursively build the acceleration tree
+        buildAccTree(rootIdx, 0, allTriangles);
+    }
+    
+
+    
+    /// Traverse tree and find closest intersection
+    bool intersect(const CRTRay& ray, float& closestT, int& hitTriangleIdx, 
+                   float& hitU, float& hitV, CRTVector& hitNormal, CRTVector& hitUV) const {
+        if (rootIdx == -1 || nodes.empty()) return false;
+        
+        closestT = std::numeric_limits<float>::infinity();
+        IntersectionData data;
+        
+        traverseNode(rootIdx, ray, closestT, data);
+        
+        if (data.triangleIndex != -1) {
+            hitTriangleIdx = data.triangleIndex;
+            hitU = data.u;
+            hitV = data.v;
+            hitNormal = data.normal;
+            hitUV = data.uv;
+            return true;
         }
         
         return false;
     }
+    
+    /// Fast shadow ray intersection (stops at first hit)
+    bool intersectAny(const CRTRay& ray, float maxDistance) const {
+        if (rootIdx == -1 || nodes.empty()) return false;
+        return traverseNodeAny(rootIdx, ray, maxDistance);
+    }
+    
+    /// Get triangle by index
+    const CRTTriangle& getTriangle(int index) const {
+        return sceneTriangles[index];
+    }
 
-public:
-    // Get statistics
-    void printStatistics() const {
-        int leafNodes = 0;
-        int totalTriangles = 0;
-        int maxTrianglesInLeaf = 0;
+private:
+    /// Recursively build the acceleration tree following the specified algorithm
+    void buildAccTree(int parentIdx, int depth, const std::vector<int>& triangles) {
+        // If maximum depth reached or triangles.count <= maxBoxTrianglesCount:
+        if (depth >= maxDepth || triangles.size() <= maxBoxTrianglesCount) {
+            // accTree[parentIdx].triangles = triangles
+            nodes[parentIdx].triangles = triangles;
+            // Stop the recursion!
+            return;
+        }
         
-        for (const auto& node : nodes) {
-            if (node.isLeaf()) {
-                leafNodes++;
-                int triCount = static_cast<int>(node.triangleIndices.size());
-                totalTriangles += triCount;
-                maxTrianglesInLeaf = std::max(maxTrianglesInLeaf, triCount);
+        // Split the parent CRTAABB box in two halves, alternating the split axis:
+        int splitAxis = depth % axisCount;
+        auto [child0CRTAABB, child1CRTAABB] = splitCRTAABB(nodes[parentIdx].CRTAABB, splitAxis);
+        
+        std::vector<int> child0triangles, child1triangles;
+        
+        // For each triangle in triangles:
+        for (int triangleIdx : triangles) {
+            CRTAABB triangleCRTAABB = CRTAABB::fromTriangle(sceneTriangles[triangleIdx]);
+            
+            // If triangle.CRTAABB intersects child0CRTAABB:
+            if (CRTAABBIntersects(triangleCRTAABB, child0CRTAABB)) {
+                // child0triangles += triangle
+                child0triangles.push_back(triangleIdx);
+            }
+            // If triangle.CRTAABB intersects child1CRTAABB:
+            if (CRTAABBIntersects(triangleCRTAABB, child1CRTAABB)) {
+                // child1triangles += triangle
+                child1triangles.push_back(triangleIdx);
             }
         }
         
-        std::cout << "Acceleration Tree Statistics:\n";
-        std::cout << "  Total nodes: " << nodes.size() << "\n";
-        std::cout << "  Leaf nodes: " << leafNodes << "\n";
-        std::cout << "  Average triangles per leaf: " << (leafNodes > 0 ? totalTriangles / leafNodes : 0) << "\n";
-        std::cout << "  Max triangles in leaf: " << maxTrianglesInLeaf << "\n";
+        // If child0Triangles.count > 0:
+        if (!child0triangles.empty()) {
+            // child0Idx = accTree.addNode(child0CRTAABB, -1, -1, [])
+            int child0Idx = addNode(child0CRTAABB, parentIdx, -1, -1, std::vector<int>());
+            // accTree[parentIdx].child[0] = child0Idx
+            nodes[parentIdx].children[0] = child0Idx;
+            // buildAccTree(child0Idx, depth + 1, child0Triangles)
+            
+            bool shouldThread = depth < MAX_DEPTH_FOR_THREADING && 
+                               child0triangles.size() > MIN_TRIANGLES_FOR_THREADING;
+            
+            if (shouldThread && !child1triangles.empty()) {
+                // Build child0 in parallel
+                auto future = std::async(std::launch::async, [&]() {
+                    buildAccTree(child0Idx, depth + 1, child0triangles);
+                });
+                
+                // Build child1 on current thread
+                if (!child1triangles.empty()) {
+                    int child1Idx = addNode(child1CRTAABB, parentIdx, -1, -1, std::vector<int>());
+                    nodes[parentIdx].children[1] = child1Idx;
+                    buildAccTree(child1Idx, depth + 1, child1triangles);
+                }
+                
+                future.wait(); // Wait for child0 to complete
+            } else {
+                // Build sequentially
+                buildAccTree(child0Idx, depth + 1, child0triangles);
+                
+                // If child1Triangles.count > 0:
+                if (!child1triangles.empty()) {
+                    // child1Idx = accTree.addNode(child1CRTAABB, -1, -1, [])
+                    int child1Idx = addNode(child1CRTAABB, parentIdx, -1, -1, std::vector<int>());
+                    // accTree[parentIdx].child[1] = child1Idx
+                    nodes[parentIdx].children[1] = child1Idx;
+                    // buildAccTree(child1Idx, depth + 1, child1Triangles)
+                    buildAccTree(child1Idx, depth + 1, child1triangles);
+                }
+            }
+        } else if (!child1triangles.empty()) {
+            // Only child1 has triangles
+            int child1Idx = addNode(child1CRTAABB, parentIdx, -1, -1, std::vector<int>());
+            nodes[parentIdx].children[1] = child1Idx;
+            buildAccTree(child1Idx, depth + 1, child1triangles);
+        }
+    }
+    
+    /// CRTAABB split algorithm following the specification
+    std::pair<CRTAABB, CRTAABB> splitCRTAABB(const CRTAABB& CRTAABBToSplit, int splitAxisIdx) const {
+        // Calculate the middle point for the splitting:
+        // mid = (CRTAABBToSplit.max[AASplitAxisIdx] - CRTAABBToSplit.min[AASplitAxisIdx]) / 2
+        float axisMin, axisMax;
+        if (splitAxisIdx == 0) {
+            axisMin = CRTAABBToSplit.minBounds.getX();
+            axisMax = CRTAABBToSplit.maxBounds.getX();
+        } else if (splitAxisIdx == 1) {
+            axisMin = CRTAABBToSplit.minBounds.getY();
+            axisMax = CRTAABBToSplit.maxBounds.getY();
+        } else {
+            axisMin = CRTAABBToSplit.minBounds.getZ();
+            axisMax = CRTAABBToSplit.maxBounds.getZ();
+        }
+        
+        float mid = (axisMax - axisMin) / 2.0f;
+        // splitPlaneCoordinate = CRTAABBToSplit.min[AASplitAxisIdx] + mid
+        float splitPlaneCoordinate = axisMin + mid;
+        
+        // Create A and B to be the same as CRTAABBToSplit:
+        CRTAABB A = CRTAABBToSplit; // A = CRTAABBToSplit
+        CRTAABB B = CRTAABBToSplit; // B = CRTAABBToSplit
+        
+        // Update the maximum component of A for the splitting axis:
+        // A.max[AASplitAxisIdx] = splitPlaneCoordinate
+        if (splitAxisIdx == 0) {
+            A.maxBounds = CRTVector(splitPlaneCoordinate, A.maxBounds.getY(), A.maxBounds.getZ());
+        } else if (splitAxisIdx == 1) {
+            A.maxBounds = CRTVector(A.maxBounds.getX(), splitPlaneCoordinate, A.maxBounds.getZ());
+        } else {
+            A.maxBounds = CRTVector(A.maxBounds.getX(), A.maxBounds.getY(), splitPlaneCoordinate);
+        }
+        
+        // Update the minimum component of B for the splitting axis:
+        // B.min[AASplitAxisIdx] = splitPlaneCoordinate
+        if (splitAxisIdx == 0) {
+            B.minBounds = CRTVector(splitPlaneCoordinate, B.minBounds.getY(), B.minBounds.getZ());
+        } else if (splitAxisIdx == 1) {
+            B.minBounds = CRTVector(B.minBounds.getX(), splitPlaneCoordinate, B.minBounds.getZ());
+        } else {
+            B.minBounds = CRTVector(B.minBounds.getX(), B.minBounds.getY(), splitPlaneCoordinate);
+        }
+        
+        return {A, B};
+    }
+    
+    /// Check if two CRTAABBs intersect
+    bool CRTAABBIntersects(const CRTAABB& a, const CRTAABB& b) const {
+        return (a.minBounds.getX() <= b.maxBounds.getX() && a.maxBounds.getX() >= b.minBounds.getX()) &&
+               (a.minBounds.getY() <= b.maxBounds.getY() && a.maxBounds.getY() >= b.minBounds.getY()) &&
+               (a.minBounds.getZ() <= b.maxBounds.getZ() && a.maxBounds.getZ() >= b.minBounds.getZ());
+    }
+    
+    /// Traverse node for closest intersection
+    void traverseNode(int nodeIdx, const CRTRay& ray, float& closestT, IntersectionData& data) const {
+        if (nodeIdx == -1) return;
+        
+        const CRTAccTreeNode& node = nodes[nodeIdx];
+        
+        // Check if ray intersects node's bounding box
+        float tMin, tMax;
+        if (!node.CRTAABB.intersect(ray, tMin, tMax) || tMin > closestT) {
+            return;
+        }
+        
+        // If leaf node (has triangles)
+        if (!node.triangles.empty()) {
+            float minT = closestT;
+            node.intersect(ray, closestT, sceneTriangles, std::vector<CRTMaterial>(), closestT, minT, data);
+            closestT = minT;
+        } else {
+            // Traverse children
+            // Test closer child first for early termination
+            if (node.children[0] != -1 && node.children[1] != -1) {
+                float leftTMin, leftTMax, rightTMin, rightTMax;
+                bool leftHit = nodes[node.children[0]].CRTAABB.intersect(ray, leftTMin, leftTMax);
+                bool rightHit = nodes[node.children[1]].CRTAABB.intersect(ray, rightTMin, rightTMax);
+                
+                if (leftHit && rightHit) {
+                    if (leftTMin <= rightTMin) {
+                        traverseNode(node.children[0], ray, closestT, data);
+                        traverseNode(node.children[1], ray, closestT, data);
+                    } else {
+                        traverseNode(node.children[1], ray, closestT, data);
+                        traverseNode(node.children[0], ray, closestT, data);
+                    }
+                } else if (leftHit) {
+                    traverseNode(node.children[0], ray, closestT, data);
+                } else if (rightHit) {
+                    traverseNode(node.children[1], ray, closestT, data);
+                }
+            } else {
+                // Traverse existing children
+                if (node.children[0] != -1) traverseNode(node.children[0], ray, closestT, data);
+                if (node.children[1] != -1) traverseNode(node.children[1], ray, closestT, data);
+            }
+        }
+    }
+    
+    /// Fast traversal for shadow rays (any intersection)
+    bool traverseNodeAny(int nodeIdx, const CRTRay& ray, float maxDistance) const {
+        if (nodeIdx == -1) return false;
+        
+        const CRTAccTreeNode& node = nodes[nodeIdx];
+        
+        // Check if ray intersects node's bounding box
+        if (!node.CRTAABB.intersectFast(ray)) {
+            return false;
+        }
+        
+        // If leaf node (has triangles)
+        if (!node.triangles.empty()) {
+            for (int triIdx : node.triangles) {
+                float t, u, v;
+                CRTVector normal, uv;
+                
+                if (sceneTriangles[triIdx].intersect(ray, t, u, v, normal, uv) && 
+                    t > 1e-4f && t < maxDistance) {
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            // Traverse children
+            return (node.children[0] != -1 && traverseNodeAny(node.children[0], ray, maxDistance)) ||
+                   (node.children[1] != -1 && traverseNodeAny(node.children[1], ray, maxDistance));
+        }
     }
 };
