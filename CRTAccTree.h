@@ -61,51 +61,75 @@ public:
         return idx;
     }
     
-    // AABB split algorithm
-    std::pair<CRTAABB, CRTAABB> splitAABB(const CRTAABB& aabbToSplit, int splitAxisIdx) const {
-        // Calculate the middle point for the splitting
-        float range = aabbToSplit.maxPoint.getX();
-        float minVal = aabbToSplit.minPoint.getX();
+    struct SplitResult {
+        CRTAABB leftAABB, rightAABB;
+        std::vector<int> leftTriangles, rightTriangles;
+        float cost;
+    };
+    
+    SplitResult findBestSplit(const CRTAABB& nodeAABB, const std::vector<int>& triangleIndices,
+                              const std::vector<CRTTriangle>& allTriangles) const {
+        SplitResult bestSplit;
+        bestSplit.cost = std::numeric_limits<float>::max();
         
-        switch (splitAxisIdx) {
-            case 0: // X axis
-                range = aabbToSplit.maxPoint.getX() - aabbToSplit.minPoint.getX();
-                minVal = aabbToSplit.minPoint.getX();
-                break;
-            case 1: // Y axis
-                range = aabbToSplit.maxPoint.getY() - aabbToSplit.minPoint.getY();
-                minVal = aabbToSplit.minPoint.getY();
-                break;
-            case 2: // Z axis
-                range = aabbToSplit.maxPoint.getZ() - aabbToSplit.minPoint.getZ();
-                minVal = aabbToSplit.minPoint.getZ();
-                break;
+        // Try all 3 axes
+        for (int axis = 0; axis < 3; ++axis) {
+            // Collect triangle centroids for this axis
+            std::vector<std::pair<float, int>> centroids;
+            centroids.reserve(triangleIndices.size());
+            
+            for (int triIdx : triangleIndices) {
+                const CRTTriangle& tri = allTriangles[triIdx];
+                CRTVector centroid = (tri.getVertex(0) + tri.getVertex(1) + tri.getVertex(2)) * (1.0f/3.0f);
+                float coord = (axis == 0) ? centroid.getX() : (axis == 1) ? centroid.getY() : centroid.getZ();
+                centroids.emplace_back(coord, triIdx);
+            }
+            
+            // Sort by centroid coordinate
+            std::sort(centroids.begin(), centroids.end());
+            
+            // Try different split positions
+            for (size_t i = 1; i < centroids.size(); ++i) {
+                // Split at position i (first i triangles go left)
+                std::vector<int> leftTris, rightTris;
+                leftTris.reserve(i);
+                rightTris.reserve(centroids.size() - i);
+                
+                for (size_t j = 0; j < i; ++j) {
+                    leftTris.push_back(centroids[j].second);
+                }
+                for (size_t j = i; j < centroids.size(); ++j) {
+                    rightTris.push_back(centroids[j].second);
+                }
+                
+                // Calculate AABBs for each side
+                CRTAABB leftAABB, rightAABB;
+                for (int idx : leftTris) {
+                    leftAABB.expand(CRTAABB::fromTriangle(allTriangles[idx]));
+                }
+                for (int idx : rightTris) {
+                    rightAABB.expand(CRTAABB::fromTriangle(allTriangles[idx]));
+                }
+                
+                // Calculate SAH cost
+                float leftArea = leftAABB.getSurfaceArea();
+                float rightArea = rightAABB.getSurfaceArea();
+                float totalArea = nodeAABB.getSurfaceArea();
+                
+                float cost = 1.0f + (leftArea / totalArea) * leftTris.size() + 
+                                   (rightArea / totalArea) * rightTris.size();
+                
+                if (cost < bestSplit.cost) {
+                    bestSplit.cost = cost;
+                    bestSplit.leftAABB = leftAABB;
+                    bestSplit.rightAABB = rightAABB;
+                    bestSplit.leftTriangles = std::move(leftTris);
+                    bestSplit.rightTriangles = std::move(rightTris);
+                }
+            }
         }
         
-        float mid = range / 2.0f;
-        float splitPlaneCoordinate = minVal + mid;
-        
-        // Create A and B to be the same as aabbToSplit
-        CRTAABB A = aabbToSplit;
-        CRTAABB B = aabbToSplit;
-        
-        // Update the maximum component of A for the splitting axis
-        switch (splitAxisIdx) {
-            case 0: // X axis
-                A.maxPoint = CRTVector(splitPlaneCoordinate, A.maxPoint.getY(), A.maxPoint.getZ());
-                B.minPoint = CRTVector(splitPlaneCoordinate, B.minPoint.getY(), B.minPoint.getZ());
-                break;
-            case 1: // Y axis
-                A.maxPoint = CRTVector(A.maxPoint.getX(), splitPlaneCoordinate, A.maxPoint.getZ());
-                B.minPoint = CRTVector(B.minPoint.getX(), splitPlaneCoordinate, B.minPoint.getZ());
-                break;
-            case 2: // Z axis
-                A.maxPoint = CRTVector(A.maxPoint.getX(), A.maxPoint.getY(), splitPlaneCoordinate);
-                B.minPoint = CRTVector(B.minPoint.getX(), B.minPoint.getY(), splitPlaneCoordinate);
-                break;
-        }
-        
-        return std::make_pair(A, B);
+        return bestSplit;
     }
     
     // AABB-triangle intersection algorithm
@@ -132,46 +156,34 @@ public:
                       const std::vector<CRTTriangle>& allTriangles) {
         
         // Check termination conditions
-        if (depth >= maxDepth || static_cast<int>(triangleIndices.size()) <= maxBoxTrianglesCount) {
+        if (depth >= maxDepth || 
+            static_cast<int>(triangleIndices.size()) <= maxBoxTrianglesCount ||
+            triangleIndices.size() <= 1) {
             nodes[parentIdx].triangleIndices = triangleIndices;
-            return; // Stop the recursion
+            return;
         }
         
-        // Split the parent AABB box in two halves, alternating the split axis
-        int splitAxis = depth % 3; // 3 axes: X, Y, Z
-        auto [child0AABB, child1AABB] = splitAABB(nodes[parentIdx].boundingBox, splitAxis);
+        // Find the best split
+        SplitResult split = findBestSplit(nodes[parentIdx].boundingBox, triangleIndices, allTriangles);
         
-        std::vector<int> child0Triangles;
-        std::vector<int> child1Triangles;
-        
-        // For each triangle in triangles
-        for (int triIdx : triangleIndices) {
-            const CRTTriangle& triangle = allTriangles[triIdx];
-            CRTAABB triAABB = CRTAABB::fromTriangle(triangle);
-            
-            // If triangle AABB intersects child0AABB
-            if (aabbTriangleIntersect(child0AABB, triAABB)) {
-                child0Triangles.push_back(triIdx);
-            }
-            
-            // If triangle AABB intersects child1AABB
-            if (aabbTriangleIntersect(child1AABB, triAABB)) {
-                child1Triangles.push_back(triIdx);
-            }
+        // Check if split is worthwhile (avoid bad splits)
+        if (split.leftTriangles.empty() || split.rightTriangles.empty() ||
+            split.cost >= triangleIndices.size()) {
+            // Split didn't improve things, make this a leaf
+            nodes[parentIdx].triangleIndices = triangleIndices;
+            return;
         }
         
-        // Create child nodes if they have triangles
-        if (!child0Triangles.empty()) {
-            int child0Idx = addNode(child0AABB, -1, -1, std::vector<int>());
-            nodes[parentIdx].child0Idx = child0Idx;
-            buildAccTree(child0Idx, depth + 1, child0Triangles, allTriangles);
-        }
+        // Create child nodes
+        int child0Idx = addNode(split.leftAABB, -1, -1, std::vector<int>());
+        int child1Idx = addNode(split.rightAABB, -1, -1, std::vector<int>());
         
-        if (!child1Triangles.empty()) {
-            int child1Idx = addNode(child1AABB, -1, -1, std::vector<int>());
-            nodes[parentIdx].child1Idx = child1Idx;
-            buildAccTree(child1Idx, depth + 1, child1Triangles, allTriangles);
-        }
+        nodes[parentIdx].child0Idx = child0Idx;
+        nodes[parentIdx].child1Idx = child1Idx;
+        
+        // Recursively build children
+        buildAccTree(child0Idx, depth + 1, split.leftTriangles, allTriangles);
+        buildAccTree(child1Idx, depth + 1, split.rightTriangles, allTriangles);
     }
     
     // Main build function
@@ -202,7 +214,7 @@ public:
     }
     
     // Tree traversal for ray intersection
-    bool intersect(const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
+  bool intersect(const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
                    float& closestT, int& hitTriangleIdx, float& hitU, float& hitV,
                    CRTVector& hitNormal, CRTVector& hitUV) const {
         if (nodes.empty()) return false;
@@ -211,22 +223,27 @@ public:
         hitTriangleIdx = -1;
         bool hasHit = false;
         
-        // Start traversal from root
         intersectNode(0, ray, triangles, closestT, hitTriangleIdx, hitU, hitV, hitNormal, hitUV, hasHit);
         
         return hasHit;
     }
     
 private:
-    void intersectNode(int nodeIdx, const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
+     void intersectNode(int nodeIdx, const CRTRay& ray, const std::vector<CRTTriangle>& triangles,
                        float& closestT, int& hitTriangleIdx, float& hitU, float& hitV,
                        CRTVector& hitNormal, CRTVector& hitUV, bool& hasHit) const {
         
         const CRTAccNode& node = nodes[nodeIdx];
         
-        // Test ray against node's AABB
-        if (!node.boundingBox.intersect(ray)) {
-            return; // Ray doesn't hit this node's bounding box
+        // Test ray against node's AABB with distance constraint
+        float tNear, tFar;
+        if (!node.boundingBox.intersect(ray, tNear, tFar)) {
+            return;
+        }
+        
+        // Early exit if AABB is farther than current closest hit
+        if (tNear > closestT) {
+            return;
         }
         
         if (node.isLeaf()) {
@@ -236,7 +253,7 @@ private:
                 CRTVector normal, uv;
                 
                 if (triangles[triIdx].intersect(ray, t, u, v, normal, uv)) {
-                    if (t < closestT) {
+                    if (t > 1e-4f && t < closestT) { // Add epsilon check
                         closestT = t;
                         hitTriangleIdx = triIdx;
                         hitU = u;
@@ -248,14 +265,34 @@ private:
                 }
             }
         } else {
-            // Recursively test child nodes
-            if (node.child0Idx != -1) {
-                intersectNode(node.child0Idx, ray, triangles, closestT, hitTriangleIdx, 
-                             hitU, hitV, hitNormal, hitUV, hasHit);
+            // Test children in order of distance (front-to-back traversal)
+            bool traverseChild0First = true;
+            
+            if (node.child0Idx != -1 && node.child1Idx != -1) {
+                // Calculate approximate distances to child AABBs
+                float dist0 = (nodes[node.child0Idx].boundingBox.getCenter() - ray.getOrigin()).lengthSquared();
+                float dist1 = (nodes[node.child1Idx].boundingBox.getCenter() - ray.getOrigin()).lengthSquared();
+                traverseChild0First = (dist0 <= dist1);
             }
-            if (node.child1Idx != -1) {
-                intersectNode(node.child1Idx, ray, triangles, closestT, hitTriangleIdx, 
-                             hitU, hitV, hitNormal, hitUV, hasHit);
+            
+            if (traverseChild0First) {
+                if (node.child0Idx != -1) {
+                    intersectNode(node.child0Idx, ray, triangles, closestT, hitTriangleIdx, 
+                                 hitU, hitV, hitNormal, hitUV, hasHit);
+                }
+                if (node.child1Idx != -1) {
+                    intersectNode(node.child1Idx, ray, triangles, closestT, hitTriangleIdx, 
+                                 hitU, hitV, hitNormal, hitUV, hasHit);
+                }
+            } else {
+                if (node.child1Idx != -1) {
+                    intersectNode(node.child1Idx, ray, triangles, closestT, hitTriangleIdx, 
+                                 hitU, hitV, hitNormal, hitUV, hasHit);
+                }
+                if (node.child0Idx != -1) {
+                    intersectNode(node.child0Idx, ray, triangles, closestT, hitTriangleIdx, 
+                                 hitU, hitV, hitNormal, hitUV, hasHit);
+                }
             }
         }
     }
